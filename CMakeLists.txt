@@ -36,7 +36,8 @@ include_directories(include)
 set(SOURCES
     src/attention.cpp
     src/kernels/naive_attention.cu
-    src/kernels/flash_attention.cu
+    src/kernels/flash_attention_v1.cu
+    src/kernels/flash_attention_v1_optimize.cu
     src/kernels/standard_attention.cu
 )
 

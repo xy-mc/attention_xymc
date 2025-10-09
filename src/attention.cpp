@@ -24,7 +24,7 @@ void launch_naive_attention_forward(
     float scale,
     cudaStream_t stream);
 
-void launch_flash_attention_forward(
+void launch_flash_attention_v1_forward(
     const float* Q,
     const float* K,
     const float* V,
@@ -53,7 +53,7 @@ void attention_naive_forward(
     CUDA_CHECK(cudaGetLastError());
 }
 
-void flash_attention_forward(
+void flash_attention_v1_forward(
     const float* Q,
     const float* K,
     const float* V,
@@ -61,7 +61,7 @@ void flash_attention_forward(
     const AttentionDims& dims,
     cudaStream_t stream) {
     const float scale = compute_scale(dims.D);
-    launch_flash_attention_forward(
+    launch_flash_attention_v1_forward(
         Q, K, V, O,
         dims.B, dims.H, dims.N, dims.D,
         scale,
@@ -93,6 +93,35 @@ void standard_attention_forward(
         stream);
     CUDA_CHECK(cudaGetLastError());
 }
+
+void launch_flash_attention_v1_optimize_forward(
+    const float* Q,
+    const float* K,
+    const float* V,
+    float* O,
+    int B, int H, int N, int D,
+    float scale,
+    cudaStream_t stream);
+
+// FlashAttention-style streaming forward with online softmax
+void flash_attention_v1_optimize_forward(
+    const float* Q,
+    const float* K,
+    const float* V,
+    float* O,
+    const AttentionDims& dims,
+    cudaStream_t stream) {
+    const float scale = compute_scale(dims.D);
+    launch_flash_attention_v1_optimize_forward(
+        Q, K, V, O,
+        dims.B, dims.H, dims.N, dims.D,
+        scale,
+        stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+
+
 
 } // namespace attention
 

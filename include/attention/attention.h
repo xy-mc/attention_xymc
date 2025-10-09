@@ -21,7 +21,7 @@ void attention_naive_forward(
     cudaStream_t stream = nullptr);
 
 // FlashAttention-style streaming forward with online softmax
-void flash_attention_forward(
+void flash_attention_v1_forward(
     const float* Q,
     const float* K,
     const float* V,
@@ -29,6 +29,13 @@ void flash_attention_forward(
     const AttentionDims& dims,
     cudaStream_t stream = nullptr);
 
+void flash_attention_v1_optimize_forward(
+    const float* Q,
+    const float* K,
+    const float* V,
+    float* O,
+    const AttentionDims& dims,
+    cudaStream_t stream = nullptr);
 // Standard attention with materialized S and P in HBM
 // Algorithm:
 // 1) S = Q K^T * scale

@@ -7,6 +7,7 @@
 #include <random>
 #include <cuda_runtime.h>
 #include <functional>
+#include <cmath> // Added for std::abs
 
 #define num_test 1
 
@@ -22,11 +23,28 @@ struct PerformanceResult {
 // 误差测试结果结构
 struct ErrorResult {
     std::string name;
-    double max_error;
-    double mean_error;
-    double relative_error;
+    double max_error;            // 绝对误差最大值（仅作参考）
+    double mean_error;           // 绝对误差均值（仅作参考）
+    double relative_error;       // L1 相对误差（|Δ|/|ref| 的平均，受近零影响）
+    // 更适合注意力评估的指标：
+    double rel_l2;              // 全局相对 L2：||O-Oref||2 / ||Oref||2（整体幅值偏差）
+    double max_rel;             // 元素级最大相对误差：max |Δ| / (|ref|+eps)（易受近零 ref 影响）
+    double cosine_sim;          // 全局余弦相似度：展平后的方向一致性（越接近 1 越好）
+    double row_rel_l2_mean;     // 行级相对 L2 的平均：逐 (b,h,n) 向量评估后再平均
+    double row_rel_l2_max;      // 行级相对 L2 的最大值：最差一行的相对偏差
+    double row_cos_mean;        // 行级余弦相似度均值：平均方向一致性
+    double row_cos_min;         // 行级余弦相似度最小值：最差一行的方向一致性
     bool success;
 };
+
+/*
+合理误差参考（FP32，经验值）：
+Rel L2: ≤1e-3 优秀；≤1e-2 可接受；>1e-2 需检查
+Cosine: ≥9.999e-01 优秀；≥9.99e-01 可接受；<9.9e-01 需检查
+RowRelL2Max: ≤2e-2 可接受；更大说明存在行级严重偏差
+RowCosMin: ≥9.9e-01 可接受；过低说明有行方向明显错误
+Max Rel: 易被近零参考值放大，仅用于异常排查参考
+*/
 
 // 注意力数据管理类
 class AttentionData {
@@ -180,21 +198,89 @@ ErrorResult runErrorTest(
     // 复制结果到主机
     data.copyToHost();
     
-    // 计算误差
+    // 计算误差（全局与行级）
+    const double eps = 1e-12;
     double max_error = 0.0;
     double sum_error = 0.0;
     double sum_ref = 0.0;
-    
+
+    double sum_sq_diff = 0.0;
+    double sum_sq_ref = 0.0;
+    double max_rel = 0.0;
+
+    double global_dot = 0.0;
+    double global_norm_o_sq = 0.0;
+    double global_norm_ref_sq = 0.0;
+
+    // 行级指标（对每个 (b,h,n) 的长度为 D 的向量）
+    const int B = data.dims.B;
+    const int H = data.dims.H;
+    const int N = data.dims.N;
+    const int D = data.dims.D;
+    const size_t row_stride = static_cast<size_t>(D);
+    const size_t rows = static_cast<size_t>(B) * H * N;
+
+    double row_rel_l2_sum = 0.0;
+    double row_rel_l2_max = 0.0;
+    double row_cos_sum = 0.0;
+    double row_cos_min = 1.0; // cosine ∈ [-1,1]
+
+    // 全局逐元素聚合
     for (size_t i = 0; i < data.size_O; i++) {
-        double error = std::abs(data.h_O[i] - data.h_O_ref[i]);
-        max_error = std::max(max_error, error);
-        sum_error += error;
-        sum_ref += std::abs(data.h_O_ref[i]);
+        const double o = data.h_O[i];
+        const double r = data.h_O_ref[i];
+        const double diff = o - r;
+        const double abs_diff = std::abs(diff);
+        max_error = std::max(max_error, abs_diff);
+        sum_error += abs_diff;
+        sum_ref += std::abs(r);
+
+        sum_sq_diff += diff * diff;
+        sum_sq_ref += r * r;
+        const double rel = abs_diff / (std::abs(r) + eps);
+        if (rel > max_rel) max_rel = rel;
+
+        global_dot += o * r;
+        global_norm_o_sq += o * o;
+        global_norm_ref_sq += r * r;
     }
-    
+
+    // 行级循环
+    for (size_t row = 0; row < rows; ++row) {
+        const size_t base = row * row_stride;
+        double row_diff_sq = 0.0;
+        double row_ref_sq = 0.0;
+        double row_dot = 0.0;
+        double row_o_sq = 0.0;
+        for (int d = 0; d < D; ++d) {
+            const double o = data.h_O[base + d];
+            const double r = data.h_O_ref[base + d];
+            const double diff = o - r;
+            row_diff_sq += diff * diff;
+            row_ref_sq += r * r;
+            row_dot += o * r;
+            row_o_sq += o * o;
+        }
+        const double row_rel_l2 = std::sqrt(row_diff_sq) / (std::sqrt(row_ref_sq) + eps);
+        row_rel_l2_sum += row_rel_l2;
+        if (row_rel_l2 > row_rel_l2_max) row_rel_l2_max = row_rel_l2;
+
+        const double row_cos = row_dot / (std::sqrt(row_o_sq) * std::sqrt(row_ref_sq) + eps);
+        row_cos_sum += row_cos;
+        if (row_cos < row_cos_min) row_cos_min = row_cos;
+    }
+
+    // 写入结果
     result.max_error = max_error;
     result.mean_error = sum_error / data.size_O;
     result.relative_error = (sum_ref > 0) ? (sum_error / sum_ref) : 0.0;
+    result.rel_l2 = std::sqrt(sum_sq_diff) / (std::sqrt(sum_sq_ref) + eps);
+    result.max_rel = max_rel;
+    result.cosine_sim = global_dot / (std::sqrt(global_norm_o_sq) * std::sqrt(global_norm_ref_sq) + eps);
+    result.row_rel_l2_mean = row_rel_l2_sum / static_cast<double>(rows);
+    result.row_rel_l2_max = row_rel_l2_max;
+    result.row_cos_mean = row_cos_sum / static_cast<double>(rows);
+    result.row_cos_min = row_cos_min;
     result.success = true;
     
     return result;
@@ -217,9 +303,11 @@ void printPerformanceResult(const PerformanceResult& result) {
 void printErrorResult(const ErrorResult& result) {
     if (result.success) {
         std::cout << std::left << std::setw(25) << result.name
-                  << std::right << std::setw(15) << std::scientific << std::setprecision(2) << result.max_error
-                  << std::setw(15) << std::setprecision(2) << result.mean_error
-                  << std::setw(15) << std::setprecision(2) << result.relative_error
+                  << std::right << std::setw(14) << std::scientific << std::setprecision(2) << result.rel_l2
+                  << std::setw(14) << std::setprecision(2) << result.max_rel
+                  << std::setw(14) << std::setprecision(2) << result.cosine_sim
+                  << std::setw(14) << std::setprecision(2) << result.row_rel_l2_max
+                  << std::setw(14) << std::setprecision(2) << result.row_cos_min
                   << std::endl;
     } else {
         std::cout << std::left << std::setw(25) << result.name << "FAILED" << std::endl;
@@ -253,7 +341,7 @@ void write_matrix_to_file(const std::string& filename, const float* matrix, int 
 
 // 运行参考实现
 void run_reference(AttentionData& data) {
-    attention::attention_naive_forward(data.d_Q, data.d_K, data.d_V, data.d_O, data.dims, 0);
+    attention::standard_attention_forward(data.d_Q, data.d_K, data.d_V, data.d_O, data.dims, 0);
     cudaDeviceSynchronize();
     data.copyRefToHost();
 }
@@ -289,12 +377,15 @@ int main() {
         // 运行所有版本的注意力
         std::vector<PerformanceResult> results;
         
-        results.push_back(runPerformanceTest(
-            attention::attention_naive_forward, data, num_test, "Naive Attention"));
-        results.push_back(runPerformanceTest(
-            attention::flash_attention_forward, data, num_test, "Flash Attention"));
+        // results.push_back(runPerformanceTest(
+        //     attention::attention_naive_forward, data, num_test, "Naive Attention"));
         results.push_back(runPerformanceTest(
             attention::standard_attention_forward, data, num_test, "Standard Attention"));
+        results.push_back(runPerformanceTest(
+            attention::flash_attention_v1_forward, data, num_test, "Flash Attention_v1"));
+        results.push_back(runPerformanceTest(
+            attention::flash_attention_v1_optimize_forward, data, num_test, "Flash Attention_v1_optimize"));
+        
 
         // 打印性能结果
         std::cout << "\nPerformance Results:\n"
@@ -314,33 +405,37 @@ int main() {
         std::cout << "\nError Analysis (compared with reference):\n"
                   << "========================================\n";
         std::cout << std::left << std::setw(25) << "Implementation"
-                  << std::right << std::setw(15) << "Max Error"
-                  << std::setw(15) << "Mean Error"
-                  << std::setw(15) << "Relative Error"
+                  << std::right << std::setw(14) << "Rel L2"
+                  << std::setw(14) << "Max Rel"
+                  << std::setw(14) << "Cosine"
+                  << std::setw(14) << "RowRelL2Max"
+                  << std::setw(14) << "RowCosMin"
                   << std::endl;
         std::cout << "----------------------------------------\n";
         
         std::vector<ErrorResult> error_results;
-        error_results.push_back(runErrorTest(
-            attention::attention_naive_forward, data, "Naive Attention"));
-        error_results.push_back(runErrorTest(
-            attention::flash_attention_forward, data, "Flash Attention"));
+        // error_results.push_back(runErrorTest(
+        //     attention::attention_naive_forward, data, "Naive Attention"));
         error_results.push_back(runErrorTest(
             attention::standard_attention_forward, data, "Standard Attention"));
-        
+        error_results.push_back(runErrorTest(
+            attention::flash_attention_v1_forward, data, "Flash Attention_v1"));
+        error_results.push_back(runErrorTest(
+            attention::flash_attention_v1_optimize_forward, data, "Flash Attention_v1_optimize"));
+            
         for (const auto& result : error_results) {
             printErrorResult(result);
         }
 
         // 输出结果到文件
-        data.copyToHost();
-        std::string filename = "attention_result_" + 
-            std::to_string(dims.B) + "x" + 
-            std::to_string(dims.H) + "x" + 
-            std::to_string(dims.N) + "x" + 
-            std::to_string(dims.D) + ".txt";
-        write_matrix_to_file(filename, data.h_O, dims.B, dims.H, dims.N, dims.D);
-        std::cout << "\nResults written to: " << filename << std::endl;
+        // data.copyToHost();
+        // std::string filename = "attention_result_" + 
+        //     std::to_string(dims.B) + "x" + 
+        //     std::to_string(dims.H) + "x" + 
+        //     std::to_string(dims.N) + "x" + 
+        //     std::to_string(dims.D) + ".txt";
+        // write_matrix_to_file(filename, data.h_O, dims.B, dims.H, dims.N, dims.D);
+        // std::cout << "\nResults written to: " << filename << std::endl;
     }
 
     return 0;

@@ -18,8 +18,8 @@ __global__ void compute_scores_kernel(
     const float* __restrict__ Q,
     const float* __restrict__ K,
     float* __restrict__ S,
-    int B, int H, int N, int D,
-    float scale) {
+    const int B, const int H, const int N, const int D,
+    const float scale) {
     const int row = blockIdx.x; // (b,h,n)
     const int total_rows = B * H * N;
     if (row >= total_rows) return;
@@ -45,7 +45,7 @@ __global__ void compute_scores_kernel(
 __global__ void softmax_rows_kernel(
     const float* __restrict__ S,
     float* __restrict__ P,
-    int B, int H, int N) {
+    const int B, const int H, const int N) {
     const int row = blockIdx.x; // (b,h,n)
     const int total_rows = B * H * N;
     if (row >= total_rows) return;
@@ -80,7 +80,7 @@ __global__ void apply_values_kernel(
     const float* __restrict__ P,
     const float* __restrict__ V,
     float* __restrict__ O,
-    int B, int H, int N, int D) {
+    const int B, const int H, const int N, const int D) {
     const int row = blockIdx.x; // (b,h,n)
     const int total_rows = B * H * N;
     if (row >= total_rows) return;
@@ -106,8 +106,8 @@ void launch_standard_attention_forward(
     const float* K,
     const float* V,
     float* O,
-    int B, int H, int N, int D,
-    float scale,
+    const int B, const int H, const int N, const int D,
+    const float scale,
     cudaStream_t stream) {
     const int total_rows = B * H * N;
     const size_t size_scores = static_cast<size_t>(B) * H * N * N;

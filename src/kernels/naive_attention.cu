@@ -13,8 +13,8 @@ __global__ void naive_attention_forward_kernel(
     const float* __restrict__ K,
     const float* __restrict__ V,
     float* __restrict__ O,
-    int B, int H, int N, int D,
-    float scale) {
+    const int B, const int H, const int N, const int D,
+    const float scale) {
     
     const int b = blockIdx.x;
     const int h = blockIdx.y;
@@ -70,8 +70,8 @@ void launch_naive_attention_forward(
     const float* K,
     const float* V,
     float* O,
-    int B, int H, int N, int D,
-    float scale,
+    const int B, const int H, const int N, const int D,
+    const float scale,
     cudaStream_t stream) {
     dim3 grid(B, H);
     dim3 block(N);

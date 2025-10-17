@@ -16,8 +16,8 @@ __global__ void flash_attention_v1_optimize_forward_kernel(
     const float* __restrict__ K,
     const float* __restrict__ V,
     float* __restrict__ O,
-    int B, int H, int N, int D,
-    float scale, 
+    const int B, const int H, const int N, const int D,
+    const float scale, 
     const int Br, const int Bc, const int Tr, const int Tc,
     float* __restrict__ l,
     float* __restrict__ m) {
@@ -103,8 +103,8 @@ void launch_flash_attention_v1_optimize_forward(
     const float* K,
     const float* V,
     float* O,
-    int B, int H, int N, int D,
-    float scale,
+    const int B, const int H, const int N, const int D,
+    const float scale,
     cudaStream_t stream) {
     
     const int Br = D;

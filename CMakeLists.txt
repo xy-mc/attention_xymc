@@ -38,6 +38,9 @@ set(SOURCES
     src/kernels/naive_attention.cu
     src/kernels/flash_attention_v1.cu
     src/kernels/flash_attention_v1_optimize.cu
+    src/kernels/flash_attention_v2.cu
+    src/kernels/flash_attention_v2_optimize.cu
+    src/kernels/flash_attention_target.cu
     src/kernels/standard_attention.cu
 )
 

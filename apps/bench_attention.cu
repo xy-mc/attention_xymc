@@ -9,6 +9,20 @@
 #include <functional>
 #include <cmath> // Added for std::abs
 
+/*
+smem 是max(smem_qk,smem_v)
+中间计算结果可以放在寄存器里面
+两次矩阵乘法  
+1.Br Bc D
+2.Br D Bc
+
+常见 B H N D尺寸
+B 1-64 1 2 4 8 16 32 64
+H 12 16 32 64 96
+N 128 256 512 1024 2048 4096
+D 64 128
+*/
+
 #define num_test 1
 
 // 性能测试结果结构
@@ -322,7 +336,7 @@ void write_matrix_to_file(const std::string& filename, const float* matrix, int 
         return;
     }
 
-    outfile << std::fixed << std::setprecision(6);
+    outfile << std::fixed << std::setprecision(30);
     for (int b = 0; b < B; b++) {
         for (int h = 0; h < H; h++) {
             outfile << "Batch " << b << ", Head " << h << ":\n";
@@ -379,13 +393,18 @@ int main() {
         
         // results.push_back(runPerformanceTest(
         //     attention::attention_naive_forward, data, num_test, "Naive Attention"));
+        // results.push_back(runPerformanceTest(
+        //     attention::standard_attention_forward, data, num_test, "Standard Attention"));
+        // results.push_back(runPerformanceTest(
+        //     attention::flash_attention_v1_forward, data, num_test, "Flash Attention_v1"));
+        // results.push_back(runPerformanceTest(
+        //     attention::flash_attention_v2_forward, data, num_test, "Flash Attention_v2"));
+        // results.push_back(runPerformanceTest(
+        //     attention::flash_attention_v1_optimize_forward, data, num_test, "Flash Attention_v1_optimize"));
         results.push_back(runPerformanceTest(
-            attention::standard_attention_forward, data, num_test, "Standard Attention"));
+            attention::flash_attention_v2_optimize_forward, data, num_test, "Flash Attention_v2_optimize"));
         results.push_back(runPerformanceTest(
-            attention::flash_attention_v1_forward, data, num_test, "Flash Attention_v1"));
-        results.push_back(runPerformanceTest(
-            attention::flash_attention_v1_optimize_forward, data, num_test, "Flash Attention_v1_optimize"));
-        
+            attention::flash_attention_target_forward, data, num_test, "Flash Attention_target_half"));
 
         // 打印性能结果
         std::cout << "\nPerformance Results:\n"
@@ -416,26 +435,51 @@ int main() {
         std::vector<ErrorResult> error_results;
         // error_results.push_back(runErrorTest(
         //     attention::attention_naive_forward, data, "Naive Attention"));
-        error_results.push_back(runErrorTest(
-            attention::standard_attention_forward, data, "Standard Attention"));
-        error_results.push_back(runErrorTest(
-            attention::flash_attention_v1_forward, data, "Flash Attention_v1"));
-        error_results.push_back(runErrorTest(
-            attention::flash_attention_v1_optimize_forward, data, "Flash Attention_v1_optimize"));
-            
+        // error_results.push_back(runErrorTest(
+        //     attention::standard_attention_forward, data, "Standard Attention"));
+        // error_results.push_back(runErrorTest(
+        //     attention::flash_attention_v1_forward, data, "Flash Attention_v1"));
+        // error_results.push_back(runErrorTest(
+        //     attention::flash_attention_v2_forward, data, "Flash Attention_v2"));
+        // error_results.push_back(runErrorTest(
+        //     attention::flash_attention_v1_optimize_forward, data, "Flash Attention_v1_optimize"));
+        // error_results.push_back(runErrorTest(
+        //     attention::flash_attention_v2_optimize_forward, data, "Flash Attention_v2_optimize"));
+        // error_results.push_back(runErrorTest(
+        //     attention::flash_attention_target_forward, data, "Flash Attention_target_half"));
+
         for (const auto& result : error_results) {
             printErrorResult(result);
         }
 
         // 输出结果到文件
-        // data.copyToHost();
-        // std::string filename = "attention_result_" + 
+        // std::string base_filename = "attention_result_" + 
         //     std::to_string(dims.B) + "x" + 
         //     std::to_string(dims.H) + "x" + 
         //     std::to_string(dims.N) + "x" + 
-        //     std::to_string(dims.D) + ".txt";
-        // write_matrix_to_file(filename, data.h_O, dims.B, dims.H, dims.N, dims.D);
-        // std::cout << "\nResults written to: " << filename << std::endl;
+        //     std::to_string(dims.D);
+        
+        // 输出参考结果
+        // std::string ref_filename = base_filename + "_reference.txt";
+        // write_matrix_to_file(ref_filename, data.h_O_ref, dims.B, dims.H, dims.N, dims.D);
+        // std::cout << "\nReference results written to: " << ref_filename << std::endl;
+        
+        // // 重新运行各个实现并分别输出结果
+        // // v1_optimize
+        // attention::flash_attention_v2_forward(data.d_Q, data.d_K, data.d_V, data.d_O, data.dims, 0);
+        // cudaDeviceSynchronize();
+        // data.copyToHost();
+        // std::string v1_filename = base_filename + "_v2.txt";
+        // write_matrix_to_file(v1_filename, data.h_O, dims.B, dims.H, dims.N, dims.D);
+        // std::cout << "V1 optimize results written to: " << v1_filename << std::endl;
+        
+        // // v2_optimize
+        // attention::flash_attention_v2_optimize_forward(data.d_Q, data.d_K, data.d_V, data.d_O, data.dims, 0);
+        // cudaDeviceSynchronize();
+        // data.copyToHost();
+        // std::string v2_filename = base_filename + "_v2_optimize.txt";
+        // write_matrix_to_file(v2_filename, data.h_O, dims.B, dims.H, dims.N, dims.D);
+        // std::cout << "V2 optimize results written to: " << v2_filename << std::endl;
     }
 
     return 0;

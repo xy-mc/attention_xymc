@@ -36,6 +36,31 @@ void flash_attention_v1_optimize_forward(
     float* O,
     const AttentionDims& dims,
     cudaStream_t stream = nullptr);
+
+void flash_attention_v2_forward(
+    const float* Q,
+    const float* K,
+    const float* V,
+    float* O,
+    const AttentionDims& dims,
+    cudaStream_t stream = nullptr);
+
+void flash_attention_v2_optimize_forward(
+    const float* Q,
+    const float* K,
+    const float* V,
+    float* O,
+    const AttentionDims& dims,
+    cudaStream_t stream = nullptr);
+
+// FlashAttention-2 target kernel (Tensor Core half-precision implementation)
+void flash_attention_target_forward(
+    const float* Q,
+    const float* K,
+    const float* V,
+    float* O,
+    const AttentionDims& dims,
+    cudaStream_t stream = nullptr);
 // Standard attention with materialized S and P in HBM
 // Algorithm:
 // 1) S = Q K^T * scale

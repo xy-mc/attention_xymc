@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 #include <functional>
 #include <cmath> // Added for std::abs
+#include <string>
 
 /*
 smem 是max(smem_qk,smem_v)
@@ -104,8 +105,17 @@ public:
     void initialize() {
         std::random_device rd;
         std::mt19937 gen(rd());
-        std::normal_distribution<float> dis(0.0f, 0.1f);
+        std::normal_distribution<float> dis(0.0f, 1.0f);
         
+        for (size_t i = 0; i < size_Q; i++) h_Q[i] = dis(gen);
+        for (size_t i = 0; i < size_K; i++) h_K[i] = dis(gen);
+        for (size_t i = 0; i < size_V; i++) h_V[i] = dis(gen);
+    }
+
+    // 生成 N(mean, std^2) 的 Q/K/V（可复现）
+    void initialize_normal(float mean = 0.0f, float std = 1.0f, uint64_t seed = 42) {
+        std::mt19937 gen(static_cast<uint32_t>(seed));
+        std::normal_distribution<float> dis(mean, std);
         for (size_t i = 0; i < size_Q; i++) h_Q[i] = dis(gen);
         for (size_t i = 0; i < size_K; i++) h_K[i] = dis(gen);
         for (size_t i = 0; i < size_V; i++) h_V[i] = dis(gen);
@@ -213,7 +223,7 @@ ErrorResult runErrorTest(
     data.copyToHost();
     
     // 计算误差（全局与行级）
-    const double eps = 1e-12;
+    const double eps = 1e-6; // stability for near-zero denominators
     double max_error = 0.0;
     double sum_error = 0.0;
     double sum_ref = 0.0;
@@ -251,7 +261,7 @@ ErrorResult runErrorTest(
 
         sum_sq_diff += diff * diff;
         sum_sq_ref += r * r;
-        const double rel = abs_diff / (std::abs(r) + eps);
+        const double rel = abs_diff / std::max(std::abs(r), eps);
         if (rel > max_rel) max_rel = rel;
 
         global_dot += o * r;
@@ -275,7 +285,8 @@ ErrorResult runErrorTest(
             row_dot += o * r;
             row_o_sq += o * o;
         }
-        const double row_rel_l2 = std::sqrt(row_diff_sq) / (std::sqrt(row_ref_sq) + eps);
+        const double tau_row = 1e-2 * std::sqrt(static_cast<double>(D));
+        const double row_rel_l2 = std::sqrt(row_diff_sq) / std::max(std::sqrt(row_ref_sq), tau_row);
         row_rel_l2_sum += row_rel_l2;
         if (row_rel_l2 > row_rel_l2_max) row_rel_l2_max = row_rel_l2;
 
@@ -288,7 +299,7 @@ ErrorResult runErrorTest(
     result.max_error = max_error;
     result.mean_error = sum_error / data.size_O;
     result.relative_error = (sum_ref > 0) ? (sum_error / sum_ref) : 0.0;
-    result.rel_l2 = std::sqrt(sum_sq_diff) / (std::sqrt(sum_sq_ref) + eps);
+    result.rel_l2 = std::sqrt(sum_sq_diff) / std::max(std::sqrt(sum_sq_ref), eps);
     result.max_rel = max_rel;
     result.cosine_sim = global_dot / (std::sqrt(global_norm_o_sq) * std::sqrt(global_norm_ref_sq) + eps);
     result.row_rel_l2_mean = row_rel_l2_sum / static_cast<double>(rows);
@@ -298,6 +309,78 @@ ErrorResult runErrorTest(
     result.success = true;
     
     return result;
+}
+
+// 将矩阵结果写入文件
+void write_matrix_to_file(const std::string& filename, const float* matrix, int B, int H, int N, int D) {
+    std::ofstream outfile(filename);
+    if (!outfile.is_open()) {
+        std::cerr << "Error: Could not open file " << filename << std::endl;
+        return;
+    }
+
+    outfile << std::fixed << std::setprecision(30);
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < H; h++) {
+            outfile << "Batch " << b << ", Head " << h << ":\n";
+            for (int n = 0; n < N; n++) {
+                for (int d = 0; d < D; d++) {
+                    int idx = ((b * H + h) * N + n) * D + d;
+                    outfile << matrix[idx] << " ";
+                }
+                outfile << "\n";
+            }
+            outfile << "\n";
+        }
+    }
+    outfile.close();
+}
+
+// 将矩阵的一个 (b,h) 在 N 维从 n0 开始、大小为 Br 的切片，以 Br×D 形式写入
+void write_matrix_tile_BrD(const std::string& filename,
+                           const float* matrix,
+                           int B, int H, int N, int D,
+                           int b, int h, int n0, int Br) {
+    std::ofstream outfile(filename);
+    if (!outfile.is_open()) {
+        std::cerr << "Error: Could not open file " << filename << std::endl;
+        return;
+    }
+
+    const int n_end = std::min(n0 + Br, N);
+    outfile << std::fixed << std::setprecision(30);
+    outfile << "Slice (b=" << b << ", h=" << h << ", n in [" << n0 << ", " << (n_end - 1) << "]) as BrxD\n";
+    for (int n = n0; n < n_end; ++n) {
+        for (int d = 0; d < D; ++d) {
+            const int idx = ((b * H + h) * N + n) * D + d; // BHND
+            outfile << matrix[idx] << (d + 1 == D ? '\n' : ' ');
+        }
+    }
+    outfile.close();
+}
+
+// 运行一个实现并把输出写入文件
+using RunFunc = std::function<void(const float*, const float*, const float*, float*, const attention::AttentionDims&, cudaStream_t)>;
+
+void run_and_write(const RunFunc& func, AttentionData& data, const std::string& filename) {
+    func(data.d_Q, data.d_K, data.d_V, data.d_O, data.dims, 0);
+    cudaDeviceSynchronize();
+    data.copyToHost();
+    // write_matrix_to_file(filename, data.h_O, data.dims.B, data.dims.H, data.dims.N, data.dims.D);
+    write_matrix_tile_BrD(filename, data.h_O, data.dims.B, data.dims.H, data.dims.N, data.dims.D, 0, 0, 0, 64);
+    std::cout << "Results written to: " << filename << std::endl;
+}
+
+// 批量输出指定实现的结果
+void dump_selected_results(AttentionData& data,
+                           const std::vector<std::pair<RunFunc, std::string>>& items,
+                           const std::string& base_filename) {
+    for (const auto& it : items) {
+        const auto& fn = it.first;
+        const auto& tag = it.second; // 例如 "v2_optimize" / "mma"
+        std::string filename = base_filename + "_" + tag + ".txt";
+        run_and_write(fn, data, filename);
+    }
 }
 
 // 打印性能结果
@@ -326,31 +409,6 @@ void printErrorResult(const ErrorResult& result) {
     } else {
         std::cout << std::left << std::setw(25) << result.name << "FAILED" << std::endl;
     }
-}
-
-// 将矩阵结果写入文件
-void write_matrix_to_file(const std::string& filename, const float* matrix, int B, int H, int N, int D) {
-    std::ofstream outfile(filename);
-    if (!outfile.is_open()) {
-        std::cerr << "Error: Could not open file " << filename << std::endl;
-        return;
-    }
-
-    outfile << std::fixed << std::setprecision(30);
-    for (int b = 0; b < B; b++) {
-        for (int h = 0; h < H; h++) {
-            outfile << "Batch " << b << ", Head " << h << ":\n";
-            for (int n = 0; n < N; n++) {
-                for (int d = 0; d < D; d++) {
-                    int idx = ((b * H + h) * N + n) * D + d;
-                    outfile << matrix[idx] << " ";
-                }
-                outfile << "\n";
-            }
-            outfile << "\n";
-        }
-    }
-    outfile.close();
 }
 
 // 运行参考实现
@@ -382,7 +440,9 @@ int main() {
 
         // 创建并初始化数据
         AttentionData data(dims);
-        data.initialize();
+        // 生成可复现的 N(0,1) 测试数据
+        data.initialize_normal(0.0f, 1.0f, /*seed=*/1234);
+        // data.initialize();
         data.copyToDevice();
 
         // 运行参考实现
@@ -401,10 +461,12 @@ int main() {
         //     attention::flash_attention_v2_forward, data, num_test, "Flash Attention_v2"));
         // results.push_back(runPerformanceTest(
         //     attention::flash_attention_v1_optimize_forward, data, num_test, "Flash Attention_v1_optimize"));
+        // results.push_back(runPerformanceTest(
+        //     attention::flash_attention_v2_optimize_forward, data, num_test, "Flash Attention_v2_optimize"));
         results.push_back(runPerformanceTest(
-            attention::flash_attention_v2_optimize_forward, data, num_test, "Flash Attention_v2_optimize"));
-        results.push_back(runPerformanceTest(
-            attention::flash_attention_target_forward, data, num_test, "Flash Attention_target_half"));
+            attention::flash_attention_mma_forward, data, num_test, "Flash Attention_mma"));
+        // results.push_back(runPerformanceTest(
+        //     attention::flash_attention_target_forward, data, num_test, "Flash Attention_target_half"));
 
         // 打印性能结果
         std::cout << "\nPerformance Results:\n"
@@ -446,40 +508,36 @@ int main() {
         // error_results.push_back(runErrorTest(
         //     attention::flash_attention_v2_optimize_forward, data, "Flash Attention_v2_optimize"));
         // error_results.push_back(runErrorTest(
+        //     attention::flash_attention_mma_forward, data, "Flash Attention_mma"));
+        // error_results.push_back(runErrorTest(
         //     attention::flash_attention_target_forward, data, "Flash Attention_target_half"));
 
         for (const auto& result : error_results) {
             printErrorResult(result);
         }
 
-        // 输出结果到文件
-        // std::string base_filename = "attention_result_" + 
-        //     std::to_string(dims.B) + "x" + 
-        //     std::to_string(dims.H) + "x" + 
-        //     std::to_string(dims.N) + "x" + 
+        // 输出结果到文件（选择要输出的实现）
+        // std::string base_filename = std::string("attention_result_") +
+        //     std::to_string(dims.B) + "x" +
+        //     std::to_string(dims.H) + "x" +
+        //     std::to_string(dims.N) + "x" +
         //     std::to_string(dims.D);
-        
-        // 输出参考结果
+
+        // // 参考结果
         // std::string ref_filename = base_filename + "_reference.txt";
-        // write_matrix_to_file(ref_filename, data.h_O_ref, dims.B, dims.H, dims.N, dims.D);
+        // // write_matrix_to_file(ref_filename, data.h_O_ref, dims.B, dims.H, dims.N, dims.D);
+        // write_matrix_tile_BrD(ref_filename, data.h_O_ref, dims.B, dims.H, dims.N, dims.D, 0, 0, 0, 64);
         // std::cout << "\nReference results written to: " << ref_filename << std::endl;
-        
-        // // 重新运行各个实现并分别输出结果
-        // // v1_optimize
-        // attention::flash_attention_v2_forward(data.d_Q, data.d_K, data.d_V, data.d_O, data.dims, 0);
-        // cudaDeviceSynchronize();
-        // data.copyToHost();
-        // std::string v1_filename = base_filename + "_v2.txt";
-        // write_matrix_to_file(v1_filename, data.h_O, dims.B, dims.H, dims.N, dims.D);
-        // std::cout << "V1 optimize results written to: " << v1_filename << std::endl;
-        
-        // // v2_optimize
-        // attention::flash_attention_v2_optimize_forward(data.d_Q, data.d_K, data.d_V, data.d_O, data.dims, 0);
-        // cudaDeviceSynchronize();
-        // data.copyToHost();
-        // std::string v2_filename = base_filename + "_v2_optimize.txt";
-        // write_matrix_to_file(v2_filename, data.h_O, dims.B, dims.H, dims.N, dims.D);
-        // std::cout << "V2 optimize results written to: " << v2_filename << std::endl;
+
+        // // 根据需要在此列表中添加/移除要输出的实现
+        // dump_selected_results(
+        //     data,
+        //     {
+        //         {attention::flash_attention_v2_forward, "v2"},
+        //         {attention::flash_attention_v2_optimize_forward, "v2_optimize"},
+        //         {attention::flash_attention_mma_forward, "mma"}
+        //     },
+        //     base_filename);
     }
 
     return 0;

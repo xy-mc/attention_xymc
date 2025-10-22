@@ -43,6 +43,15 @@ __global__ void flash_attention_v2_forward_kernel(
 
         __syncthreads();
 
+        // if (tx == 0 && i == 0 && b == 0 && h == 0) {
+        //     for (int k = 0; k < Br; k++) {
+        //         for (int d = 0; d < D; d++) {
+        //             printf("smem_q[%d][%d]: %f  ", k, d, smem_q[k * D + d]);
+        //         }
+        //         printf("\n");
+        //     }
+        // }
+        
         float l_cur = 0.0f;
         float m_cur = -FLT_MAX;
 

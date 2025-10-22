@@ -31,7 +31,7 @@ endif()
 
 # 添加头文件目录
 include_directories(include)
-
+include_directories(../cutlass/include ../cutlass/tools/util/include)
 # 添加源文件
 set(SOURCES
     src/attention.cpp
@@ -40,6 +40,7 @@ set(SOURCES
     src/kernels/flash_attention_v1_optimize.cu
     src/kernels/flash_attention_v2.cu
     src/kernels/flash_attention_v2_optimize.cu
+    src/kernels/flash_attention_mma.cu
     src/kernels/flash_attention_target.cu
     src/kernels/standard_attention.cu
 )

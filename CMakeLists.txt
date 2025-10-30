@@ -41,6 +41,7 @@ set(SOURCES
     src/kernels/flash_attention_v2.cu
     src/kernels/flash_attention_v2_optimize.cu
     src/kernels/flash_attention_mma.cu
+    src/kernels/flash_attention_mma_optimize.cu
     src/kernels/flash_attention_target.cu
     src/kernels/standard_attention.cu
 )
@@ -50,5 +51,13 @@ add_executable(bench_attention apps/bench_attention.cu ${SOURCES})
 
 # 链接CUDA库
 target_link_libraries(bench_attention cublas cudart)
+
+
+# 测试程序：test_swizzle
+# add_executable(test_swizzle apps/test_swizzle.cu)
+# target_link_libraries(test_swizzle cudart)
+
+# 仅主机端测试：test_swizzle_host（打印 64x64，x 步长 4）
+add_executable(test_swizzle_host apps/test_swizzle_host.cpp)
 
 

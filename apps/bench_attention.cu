@@ -419,15 +419,28 @@ void run_reference(AttentionData& data) {
 }
 
 int main() {
-    // 设置注意力维度 (BHND格式)
-    std::vector<attention::AttentionDims> test_cases = {
-        // {1, 8, 128, 64},      // 小规模
-        // {1, 8, 512, 64},      // 中等规模
-        {1, 8, 1024, 64},     // 大规模
-        // {1, 8, 2048, 64},     // 超大规模
-        // {2, 8, 1024, 64},     // 多批次
-        // {1, 16, 1024, 64},    // 多头
-    };
+
+    std::vector<attention::AttentionDims> test_cases;
+    // 配置集合（常见尺寸），按维度分别扫描，避免组合爆内存
+    // const std::vector<int> Bs = {1, 2, 4, 8, 16, 32, 64};
+    // const std::vector<int> Hs = {12, 16, 32, 64, 96};
+    // const std::vector<int> Ns = {128, 256, 512, 1024, 2048, 4096};
+    // const std::vector<int> Ds = {64, 128};
+
+    // // 基准（其他维度的默认值）
+    // const int B0 = 1, H0 = 8, N0 = 1024, D0 = 64;
+
+    // // 扫描 B
+    // for (int b : Bs) test_cases.push_back({b, H0, N0, D0});
+    // // 扫描 H
+    // for (int h : Hs) test_cases.push_back({B0, h, N0, D0});
+    // // 扫描 N
+    // for (int n : Ns) test_cases.push_back({B0, H0, n, D0});
+    // // 扫描 D
+    // for (int d : Ds) test_cases.push_back({B0, H0, N0, d});
+    // 额外加入几个代表性组合
+    test_cases.push_back({64, 8, 1024, 64});
+    // test_cases.push_back({16, 8, 1024, 64});
 
     // 测试每个维度
     for (const auto& dims : test_cases) {
@@ -438,15 +451,39 @@ int main() {
                   << ", D=" << dims.D << "\n"
                   << "========================================\n";
 
-        // 创建并初始化数据
+        // 在构造数据前记录一次设备显存
+        size_t free_before = 0, total_before = 0;
+        cudaMemGetInfo(&free_before, &total_before);
+
+        // 创建并初始化数据（这里会在设备侧分配 Q/K/V/O）
         AttentionData data(dims);
+
+        // 构造后再次读取一次设备显存
+        size_t free_after = 0, total_after = 0;
+        cudaMemGetInfo(&free_after, &total_after);
+
+        const size_t elems_qkvo = static_cast<size_t>(dims.B) * dims.H * dims.N * dims.D;
+        const size_t expected_qkvo_bytes = elems_qkvo * sizeof(float) * 4; // Q,K,V,O
+        const size_t actual_alloc_bytes = (free_before >= free_after) ? (free_before - free_after) : 0;
+        const size_t possible_scores_probs_bytes = static_cast<size_t>(dims.B) * dims.H * dims.N * dims.N * sizeof(float) * 2; // S+P（标准实现才会用）
+
+        auto to_mib = [](size_t bytes) { return bytes / (1024.0 * 1024.0); };
+        auto to_gib = [](size_t bytes) { return bytes / (1024.0 * 1024.0 * 1024.0); };
+
+        std::cout << std::fixed << std::setprecision(2)
+                  << "Device memory (expected Q/K/V/O): " << to_mib(expected_qkvo_bytes) << " MiB ("
+                  << to_gib(expected_qkvo_bytes) << " GiB)\n"
+                  << "Device memory (actual alloc delta): " << to_mib(actual_alloc_bytes) << " MiB ("
+                  << to_gib(actual_alloc_bytes) << " GiB)\n"
+                  << "Potential temps S/P if standard_attention enabled: "
+                  << to_mib(possible_scores_probs_bytes) << " MiB (" << to_gib(possible_scores_probs_bytes) << " GiB)\n";
         // 生成可复现的 N(0,1) 测试数据
         data.initialize_normal(0.0f, 1.0f, /*seed=*/1234);
         // data.initialize();
         data.copyToDevice();
 
         // 运行参考实现
-        run_reference(data);
+        // run_reference(data);
 
         // 运行所有版本的注意力
         std::vector<PerformanceResult> results;
@@ -463,8 +500,10 @@ int main() {
         //     attention::flash_attention_v1_optimize_forward, data, num_test, "Flash Attention_v1_optimize"));
         // results.push_back(runPerformanceTest(
         //     attention::flash_attention_v2_optimize_forward, data, num_test, "Flash Attention_v2_optimize"));
+        // results.push_back(runPerformanceTest(
+        //     attention::flash_attention_mma_forward, data, num_test, "Flash Attention_mma"));
         results.push_back(runPerformanceTest(
-            attention::flash_attention_mma_forward, data, num_test, "Flash Attention_mma"));
+            attention::flash_attention_mma_optimize_forward, data, num_test, "Flash Attention_mma_optimize"));
         // results.push_back(runPerformanceTest(
         //     attention::flash_attention_target_forward, data, num_test, "Flash Attention_target_half"));
 
@@ -510,6 +549,8 @@ int main() {
         // error_results.push_back(runErrorTest(
         //     attention::flash_attention_mma_forward, data, "Flash Attention_mma"));
         // error_results.push_back(runErrorTest(
+        //     attention::flash_attention_mma_optimize_forward, data, "Flash Attention_mma_optimize"));
+        // error_results.push_back(runErrorTest(
         //     attention::flash_attention_target_forward, data, "Flash Attention_target_half"));
 
         for (const auto& result : error_results) {
@@ -535,7 +576,8 @@ int main() {
         //     {
         //         {attention::flash_attention_v2_forward, "v2"},
         //         {attention::flash_attention_v2_optimize_forward, "v2_optimize"},
-        //         {attention::flash_attention_mma_forward, "mma"}
+        //         {attention::flash_attention_mma_forward, "mma"},
+        //         {attention::flash_attention_mma_optimize_forward, "mma_optimize"}
         //     },
         //     base_filename);
     }

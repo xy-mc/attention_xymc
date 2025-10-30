@@ -10,12 +10,26 @@ __device__ __forceinline__ int index_BHND(int b, int h, int n, int d, int B, int
     return ((b * H + h) * N + n) * D + d;
 }
 
+static __host__ __device__ __forceinline__
+uint32_t swizzle_QK(uint32_t y, uint32_t x) {
+    // x >>= 2;
+    // return ((y & 7) ^ x) << 2;
+    return ((y & 7) ^ (x >> 2)) << 2 | (x & 3);
+    // return x;
+}
+
+static __host__ __device__ __forceinline__
+uint32_t swizzle_V(uint32_t y, uint32_t x) {
+    return (((y & 7) >> 1) ^ (x >> 3)) << 3 | (x & 7);
+    // return x;
+}
+
 template<
     const int PAD,
     const int NumThreads,
-    const int KMmaAtomM,
-    const int KMmaAtomN,
-    const int KMmaAtomK,
+    const int KMmaAtomM,  // 16
+    const int KMmaAtomN,  // 8
+    const int KMmaAtomK,  // 8
     const int kMmaTileSeqLenQ,  // 4, more MMA(warp), M=16*4=64, Q@K^T=[Br(M),
                                 // d(K)]@[d(K),  Bc(N)]
     const int kMmaTileSeqLenK,  // 1, more MMA(warp), N=8*1 =8,  Q@K^T=[Br(M),
@@ -30,7 +44,7 @@ template<
     const int kWarpTileHeadDimV // 8, more values, N,
                                 // d=8*(1|2|3|4|...)=8|...|32|64|96|128|...
 >
-__global__ void flash_attention_mma_forward_kernel(
+__global__ void flash_attention_mma_optimize_forward_kernel(
     const float* __restrict__ Q,
     const float* __restrict__ K,
     const float* __restrict__ V,
@@ -42,10 +56,10 @@ __global__ void flash_attention_mma_forward_kernel(
     const int b = blockIdx.y;
     const int h = blockIdx.z;
     const int tx = threadIdx.x;
-    const int warp_id = tx / 32;
-    const int lane_id = tx % 32;
+    const int warp_id = tx / WARP_SIZE;
+    const int lane_id = tx % WARP_SIZE;
 
-    extern __shared__ float s_data[];
+    extern __shared__ __align__(16) float s_data[];
     float *smem_q = s_data;
     float *smem_k = smem_q + Br * (D + PAD);
     float *smem_v = smem_k + Bc * (D + PAD);
@@ -55,12 +69,22 @@ __global__ void flash_attention_mma_forward_kernel(
     const float *q_start = Q + index_BHND(b, h, i * Br, 0, B, H, N, D);
 
     for (int k = 0; k < (D * Br) / NumThreads; k += 4) {
-        FLOAT4(smem_q[NumThreads * k + tx * 4]) = 
-            CONST_FLOAT4(q_start[NumThreads * k + tx * 4]);
+        const int q_addr = NumThreads * k + tx * 4;
+        const int global_smem_q_y = q_addr / (D + PAD);
+        const int global_smem_q_x = q_addr % (D + PAD);
+        // FLOAT4(smem_q[global_smem_q_y * (D + PAD) + swizzle_Q(global_smem_q_y, global_smem_q_x)]) = 
+        //     CONST_FLOAT4(q_start[q_addr]);
+
+        FLOAT4(smem_q[q_addr]) = 
+            CONST_FLOAT4(q_start[global_smem_q_y * (D + PAD) + swizzle_QK(global_smem_q_y, global_smem_q_x)]);
+        
+        // if (i == 0 && b == 0 && h == 0 && global_smem_q_y == 1)
+        //     printf("global_smem_q_y: %d, global_smem_q_x: %d\n"
+        //         ,global_smem_q_y, swizzle_Q(global_smem_q_y, global_smem_q_x));
     }
 
     __syncthreads();
-    
+
     uint32_t R_Q[kWarpTileSeqLenQ][4];
     uint32_t R_K[kWarpTileSeqLenK][2];
     uint32_t R_V[kWarpTileHeadDimV][2];
@@ -82,8 +106,15 @@ __global__ void flash_attention_mma_forward_kernel(
         const float *v_start = V + index_BHND(b, h, j * Bc, 0, B, H, N, D);
 
         for (int k = 0; k < D * Bc / NumThreads; k += 4) {
-            FLOAT4(smem_k[NumThreads * k + tx * 4]) = CONST_FLOAT4(k_start[NumThreads * k + tx * 4]);
-            FLOAT4(smem_v[NumThreads * k + tx * 4]) = CONST_FLOAT4(v_start[NumThreads * k + tx * 4]);
+            const int kv_addr = NumThreads * k + tx * 4;
+            const int global_smem_kv_y = kv_addr / (D + PAD);
+            const int global_smem_kv_x = kv_addr % (D + PAD);
+
+            FLOAT4(smem_k[kv_addr]) = 
+                CONST_FLOAT4(k_start[global_smem_kv_y * (D + PAD) + swizzle_QK(global_smem_kv_y, global_smem_kv_x)]);
+            
+            FLOAT4(smem_v[kv_addr]) = 
+                CONST_FLOAT4(v_start[global_smem_kv_y * (D + PAD) + swizzle_V(global_smem_kv_y, global_smem_kv_x)]);
         }
 
         __syncthreads();
@@ -93,17 +124,20 @@ __global__ void flash_attention_mma_forward_kernel(
         lane_row_max_old[0][1] = lane_row_max_new[0][1];
 
         for (int d = 0; d < D; d += KMmaAtomK) {
-            const int smem_regQ_addr_y = lane_id % 16;
-            const int smem_regQ_addr_x = (lane_id / 16) * 4;
+            const int smem_regQ_addr_y = lane_id % 16 + warp_id * KMmaAtomM;
+            const int smem_regQ_addr_x = (lane_id / 16) * 4 + d;
 
             uint32_t smem_regQ_ptr = 
-                __cvta_generic_to_shared(&smem_q[(smem_regQ_addr_y + warp_id * KMmaAtomM) * (D + PAD) 
-                                        + smem_regQ_addr_x + d]);
-
+                __cvta_generic_to_shared(&smem_q[smem_regQ_addr_y * (D + PAD) 
+                                        + swizzle_QK(smem_regQ_addr_y, smem_regQ_addr_x)]);
+            
+            // if (i == 0 && b == 0 && h == 0 && j == 0 && d == 0 && tx == 2)
+            //         printf("smem_regQ_ptr_y: %d, smem_regQ_ptr_x: %d\n", 
+            //                 smem_regQ_addr_y, swizzle_Q(smem_regQ_addr_y, smem_regQ_addr_x));
             LDMATRIX_X4(R_Q[0][0], R_Q[0][1], R_Q[0][2], R_Q[0][3], smem_regQ_ptr);
             
             // if (i == 0 && b == 0 && h == 0 && j == 0 && warp_id == 0)
-            //     printf("mma %d: R_Q: %f %f %f %f\n", d,
+            //     printf("mma_optimize %d: R_Q: %f %f %f %f\n", d,
             //     __uint_as_float(R_Q[0][0]),
             //     __uint_as_float(R_Q[0][1]),
             //     __uint_as_float(R_Q[0][2]),
@@ -113,14 +147,17 @@ __global__ void flash_attention_mma_forward_kernel(
                 const int smem_regK_addr_y = lane_id / 4 + k * 8;
                 const int smem_regK_addr_x = lane_id % 4 + d;
 
-                R_K[k][0] = __float_as_uint(smem_k[smem_regK_addr_y * (D + PAD) + smem_regK_addr_x]);
-                R_K[k][1] = __float_as_uint(smem_k[smem_regK_addr_y * (D + PAD) + smem_regK_addr_x + 4]);
+                R_K[k][0] = __float_as_uint(smem_k[smem_regK_addr_y * (D + PAD) + 
+                    swizzle_QK(smem_regK_addr_y, smem_regK_addr_x)]);
 
+                R_K[k][1] = __float_as_uint(smem_k[smem_regK_addr_y * (D + PAD) + 
+                    swizzle_QK(smem_regK_addr_y, smem_regK_addr_x + 4)]);
+                
                 // if (i == 0 && b == 0 && h == 0 && j == 0 && d == 0 && warp_id == 0)
-                //     printf("mma K: %f %f\n",
+                //     printf("mma optimize K: %f %f\n",
                 //     __uint_as_float(R_K[k][0]),
                 //     __uint_as_float(R_K[k][1]));
-
+                
                 SMMA1688(R_S[0][k][0], R_S[0][k][1], R_S[0][k][2], R_S[0][k][3], R_Q[0][0], R_Q[0][1], R_Q[0][2], R_Q[0][3], 
                     R_K[k][0], R_K[k][1], R_S[0][k][0], R_S[0][k][1], R_S[0][k][2], R_S[0][k][3]);
             }
@@ -164,7 +201,7 @@ __global__ void flash_attention_mma_forward_kernel(
         lane_row_sum_new[0][1] = __expf(lane_row_max_old[0][1] - lane_row_max_new[0][1]) * lane_row_sum_new[0][1] + acc[0][1];
                  
         // if (i == 0 && b == 0 && h == 0 && tx == 0 && j == 0)
-        //     printf("mma: lane_row_sum_new[0][0]: %f, lane_row_sum_new[0][1]: %f\n", lane_row_sum_new[0][0], lane_row_sum_new[0][1]);
+        //     printf("mma_optimize: lane_row_sum_new[0][0]: %f, lane_row_sum_new[0][1]: %f\n", lane_row_sum_new[0][0], lane_row_sum_new[0][1]);
             
         __syncthreads();
 
@@ -183,8 +220,10 @@ __global__ void flash_attention_mma_forward_kernel(
                 const int smem_regV_addr_y = (lane_id % 4) * 2 + k * 8;
                 const int smem_regV_addr_x = lane_id / 4 + v * 8;
 
-                R_V[v][0] = __float_as_uint(smem_v[smem_regV_addr_y * (D + PAD) + smem_regV_addr_x]);
-                R_V[v][1] = __float_as_uint((smem_v[(smem_regV_addr_y + 1) * (D + PAD) + smem_regV_addr_x]));
+                R_V[v][0] = __float_as_uint(smem_v[smem_regV_addr_y * (D + PAD) + 
+                            swizzle_V(smem_regV_addr_y, smem_regV_addr_x)]);
+                R_V[v][1] = __float_as_uint(smem_v[(smem_regV_addr_y + 1) * (D + PAD) + 
+                            swizzle_V(smem_regV_addr_y + 1, smem_regV_addr_x)]);
 
                 SMMA1688(R_D[0][v][0], R_D[0][v][1], R_D[0][v][2], R_D[0][v][3], RS0, RS1, RS2, RS3, 
                     R_V[v][0], R_V[v][1], R_D[0][v][0], R_D[0][v][1], R_D[0][v][2], R_D[0][v][3]);
@@ -209,20 +248,33 @@ __global__ void flash_attention_mma_forward_kernel(
 
     // if (i == 0 && b == 0 && h == 0 && tx == 0)
     //     printf("lane_row_sum_new[0][0]: %f, lane_row_sum_new[0][1]: %f\n", lane_row_sum_new[0][0], lane_row_sum_new[0][1]);
-
     float *O_start = O + index_BHND(b, h, i * Br, 0, B, H, N, D);
+
     const int reg_global_y = warp_id * KMmaAtomM + lane_id / 4;
+
     const int reg_global_x = (lane_id % 4) * 2;
+
     for (int v = 0; v < kWarpTileHeadDimV; v++) {
-        O_start[reg_global_y * D + reg_global_x + v * KMmaAtomN] = R_O[0][v][0] / lane_row_sum_new[0][0];
-        O_start[reg_global_y * D + reg_global_x + 1 + v * KMmaAtomN] = R_O[0][v][1] / lane_row_sum_new[0][0];
-        O_start[(reg_global_y + 8) * D + reg_global_x + v * KMmaAtomN] = R_O[0][v][2] / lane_row_sum_new[0][1];
-        O_start[(reg_global_y + 8) * D + reg_global_x + 1 + v * KMmaAtomN] = R_O[0][v][3] / lane_row_sum_new[0][1];
+        
+        R_O[0][v][0] = __fdividef(R_O[0][v][0], lane_row_sum_new[0][0]);
+        R_O[0][v][1] = __fdividef(R_O[0][v][1], lane_row_sum_new[0][0]);
+        R_O[0][v][2] = __fdividef(R_O[0][v][2], lane_row_sum_new[0][1]);
+        R_O[0][v][3] = __fdividef(R_O[0][v][3], lane_row_sum_new[0][1]);
+        
+        LDST64BITS(O_start[reg_global_y * D + reg_global_x + v * KMmaAtomN])
+            = LDST64BITS(R_O[0][v][0]);
+
+        LDST64BITS(O_start[(reg_global_y + 8) * D + reg_global_x + v * KMmaAtomN])
+            = LDST64BITS(R_O[0][v][2]);
+        // O_start[reg_global_y * D + reg_global_x + v * KMmaAtomN] = R_O[0][v][0] / lane_row_sum_new[0][0];
+        // O_start[reg_global_y * D + reg_global_x + 1 + v * KMmaAtomN] = R_O[0][v][1] / lane_row_sum_new[0][0];
+        // O_start[(reg_global_y + 8) * D + reg_global_x + v * KMmaAtomN] = R_O[0][v][2] / lane_row_sum_new[0][1];
+        // O_start[(reg_global_y + 8) * D + reg_global_x + 1 + v * KMmaAtomN] = R_O[0][v][3] / lane_row_sum_new[0][1];
     }
      
 }
 
-void launch_flash_attention_mma_forward(
+void launch_flash_attention_mma_optimize_forward(
     const float* Q,
     const float* K,
     const float* V,
@@ -240,7 +292,6 @@ void launch_flash_attention_mma_forward(
     dim3 block(128);
     
     const int PAD = 0;
-
     auto smem_size = (Br * (D + PAD) + 2 * Bc * (D + PAD)) * sizeof(float);
 
     // Enable opt-in larger dynamic shared memory if available
@@ -250,11 +301,11 @@ void launch_flash_attention_mma_forward(
     cudaDeviceGetAttribute(&max_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
     // Prefer shared memory in cache config
     cudaFuncSetCacheConfig(
-        flash_attention_mma_forward_kernel<PAD, 128, 16, 8, 8, 4, 1, 4, 1, 1, 8, 1, 8>, cudaFuncCachePreferShared);
+        flash_attention_mma_optimize_forward_kernel<PAD, 128, 16, 8, 8, 4, 1, 4, 1, 1, 8, 1, 8>, cudaFuncCachePreferShared);
     // Set attribute to requested size if within opt-in limit
     if ((int)smem_size <= max_optin) {
         cudaFuncSetAttribute(
-            flash_attention_mma_forward_kernel<PAD, 128, 16, 8, 8, 4, 1, 4, 1, 1, 8, 1, 8>,
+            flash_attention_mma_optimize_forward_kernel<PAD, 128, 16, 8, 8, 4, 1, 4, 1, 1, 8, 1, 8>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             static_cast<int>(smem_size));
     } else {
@@ -264,7 +315,7 @@ void launch_flash_attention_mma_forward(
         return;
     }
  
-    flash_attention_mma_forward_kernel<PAD, 128, 16, 8, 8, 4, 1, 4, 1, 1, 8, 1, 8><<<grid, block, smem_size, stream>>>(
+    flash_attention_mma_optimize_forward_kernel<PAD, 128, 16, 8, 8, 4, 1, 4, 1, 1, 8, 1, 8><<<grid, block, smem_size, stream>>>(
         Q, K, V, O, B, H, N, D, scale, Br, Bc, Tr, Tc);
 
     // cudaFree(d_l);

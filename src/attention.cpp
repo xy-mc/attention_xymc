@@ -221,6 +221,31 @@ void flash_attention_mma_optimize_forward(
     CUDA_CHECK(cudaGetLastError());
 }
 
+void launch_flash_attention_mma_Kstage_forward(
+    const float* Q,
+    const float* K,
+    const float* V,
+    float* O,
+    const int B, const int H, const int N, const int D,
+    const float scale,
+    cudaStream_t stream);
+
+void flash_attention_mma_Kstage_forward(
+    const float* Q,
+    const float* K,
+    const float* V,
+    float* O,
+    const AttentionDims& dims,
+    cudaStream_t stream) {
+    const float scale = compute_scale(dims.D);
+    launch_flash_attention_mma_Kstage_forward(
+        Q, K, V, O,
+        dims.B, dims.H, dims.N, dims.D,
+        scale,
+        stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 extern "C" void flash_attn_target_launch_half(const __half *Q, const __half *K,
                                                const __half *V, __half *O, int B,
                                                int H, int N, int D,

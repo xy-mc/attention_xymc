@@ -42,6 +42,7 @@ set(SOURCES
     src/kernels/flash_attention_v2_optimize.cu
     src/kernels/flash_attention_mma.cu
     src/kernels/flash_attention_mma_optimize.cu
+    src/kernels/flash_attention_mma_Kstage.cu
     src/kernels/flash_attention_target.cu
     src/kernels/standard_attention.cu
 )

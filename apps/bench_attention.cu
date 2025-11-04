@@ -6,6 +6,7 @@
 #include <chrono>
 #include <random>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <functional>
 #include <cmath> // Added for std::abs
 #include <string>
@@ -202,6 +203,80 @@ PerformanceResult runPerformanceTest(
     result.bandwidth_gb_s = (bandwidth / 1e9) / (result.avg_time_ms / 1000.0);
     result.success = true;
     
+    return result;
+}
+
+// kernel-only timing for FlashAttention target (half) — exclude float<->half conversions
+extern "C" void flash_attn_target_launch_half(const __half *Q, const __half *K,
+                                               const __half *V, __half *O, int B,
+                                               int H, int N, int D,
+                                               int stages,
+                                               cudaStream_t stream);
+
+PerformanceResult runKernelOnlyTargetHalf(AttentionData& data, int num_runs, const std::string& name) {
+    PerformanceResult result;
+    result.name = name;
+    result.success = false;
+
+    const int B = data.dims.B;
+    const int H = data.dims.H;
+    const int N = data.dims.N;
+    const int D = data.dims.D;
+    const size_t elems = static_cast<size_t>(B) * H * N * D;
+    const int stages = 2;
+    cudaStream_t stream = 0;
+
+    __half *hQ = nullptr, *hK = nullptr, *hV = nullptr, *hO = nullptr;
+    cudaMalloc(&hQ, elems * sizeof(__half));
+    cudaMalloc(&hK, elems * sizeof(__half));
+    cudaMalloc(&hV, elems * sizeof(__half));
+    cudaMalloc(&hO, elems * sizeof(__half));
+
+    // Preprocess (not timed): float -> half buffers (device-to-device memcpy per existing implementation)
+    cudaMemcpyAsync(hQ, data.d_Q, elems * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(hK, data.d_K, elems * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+    cudaMemcpyAsync(hV, data.d_V, elems * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+    cudaDeviceSynchronize();
+
+    // Warmup
+    flash_attn_target_launch_half(hQ, hK, hV, hO, B, H, N, D, stages, stream);
+    cudaDeviceSynchronize();
+
+    // CUDA event timing (kernel only)
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start, stream);
+    for (int i = 0; i < num_runs; ++i) {
+        flash_attn_target_launch_half(hQ, hK, hV, hO, B, H, N, D, stages, stream);
+    }
+    cudaEventRecord(stop, stream);
+    cudaEventSynchronize(stop);
+
+    float elapsed_ms = 0.0f;
+    cudaEventElapsedTime(&elapsed_ms, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    result.avg_time_ms = static_cast<double>(elapsed_ms) / std::max(1, num_runs);
+
+    // Postprocess (not timed): half -> float output
+    cudaMemcpyAsync(data.d_O, hO, elems * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+    cudaDeviceSynchronize();
+
+    // Cleanup
+    cudaFree(hQ);
+    cudaFree(hK);
+    cudaFree(hV);
+    cudaFree(hO);
+
+    // Metrics
+    double flops = compute_attention_flops(data.dims);
+    double bandwidth = compute_attention_bandwidth(data.dims);
+    result.gflops = (flops / 1e9) / (result.avg_time_ms / 1000.0);
+    result.bandwidth_gb_s = (bandwidth / 1e9) / (result.avg_time_ms / 1000.0);
+    result.success = true;
     return result;
 }
 
@@ -427,7 +502,7 @@ int main() {
     // const std::vector<int> Ns = {128, 256, 512, 1024, 2048, 4096};
     // const std::vector<int> Ds = {64, 128};
 
-    // // 基准（其他维度的默认值）
+    // // // 基准（其他维度的默认值）
     // const int B0 = 1, H0 = 8, N0 = 1024, D0 = 64;
 
     // // 扫描 B
@@ -504,8 +579,12 @@ int main() {
         //     attention::flash_attention_mma_forward, data, num_test, "Flash Attention_mma"));
         results.push_back(runPerformanceTest(
             attention::flash_attention_mma_optimize_forward, data, num_test, "Flash Attention_mma_optimize"));
+        results.push_back(runPerformanceTest(
+            attention::flash_attention_mma_Kstage_forward, data, num_test, "Flash Attention_mma_Kstage"));
         // results.push_back(runPerformanceTest(
         //     attention::flash_attention_target_forward, data, num_test, "Flash Attention_target_half"));
+        // results.push_back(runKernelOnlyTargetHalf(
+        //     data, num_test, "Flash Attention_target_half (kernel)"));
 
         // 打印性能结果
         std::cout << "\nPerformance Results:\n"
@@ -551,7 +630,7 @@ int main() {
         // error_results.push_back(runErrorTest(
         //     attention::flash_attention_mma_optimize_forward, data, "Flash Attention_mma_optimize"));
         // error_results.push_back(runErrorTest(
-        //     attention::flash_attention_target_forward, data, "Flash Attention_target_half"));
+        //     attention::flash_attention_mma_Kstage_forward, data, "Flash Attention_mma_Kstage"));
 
         for (const auto& result : error_results) {
             printErrorResult(result);
@@ -574,10 +653,11 @@ int main() {
         // dump_selected_results(
         //     data,
         //     {
-        //         {attention::flash_attention_v2_forward, "v2"},
-        //         {attention::flash_attention_v2_optimize_forward, "v2_optimize"},
-        //         {attention::flash_attention_mma_forward, "mma"},
-        //         {attention::flash_attention_mma_optimize_forward, "mma_optimize"}
+        //         // {attention::flash_attention_v2_forward, "v2"},
+        //         // {attention::flash_attention_v2_optimize_forward, "v2_optimize"},
+        //         // {attention::flash_attention_mma_forward, "mma"},
+        //         {attention::flash_attention_mma_optimize_forward, "mma_optimize"},
+        //         {attention::flash_attention_mma_Kstage_forward, "mma_Kstage"},
         //     },
         //     base_filename);
     }

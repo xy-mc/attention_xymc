@@ -35,6 +35,11 @@ if [ $? -eq 0 ]; then
     
     # 运行测试
     ./bench_attention
+    echo ""
+    echo "运行 PyTorch SDPA 基线 (flash/mem_efficient/math)..."
+    echo "=========================================="
+    # 与 apps/bench_attention.cu 中默认测试尺寸保持一致
+    python3 ../apps/bench_sdpa.py --B 64 --H 8 --Nq 1024 --D 64 --dtype float32 --iters 50 --warmup 10 || true
     
     echo ""
     echo "=========================================="

@@ -221,12 +221,13 @@ void flash_attention_mma_optimize_forward(
     CUDA_CHECK(cudaGetLastError());
 }
 
+template<int D>
 void launch_flash_attention_mma_Kstage_forward(
     const float* Q,
     const float* K,
     const float* V,
     float* O,
-    const int B, const int H, const int N, const int D,
+    const int B, const int H, const int N,
     const float scale,
     cudaStream_t stream);
 
@@ -238,11 +239,66 @@ void flash_attention_mma_Kstage_forward(
     const AttentionDims& dims,
     cudaStream_t stream) {
     const float scale = compute_scale(dims.D);
-    launch_flash_attention_mma_Kstage_forward(
-        Q, K, V, O,
-        dims.B, dims.H, dims.N, dims.D,
-        scale,
-        stream);
+    switch (dims.D)
+    {
+        case 64:
+            launch_flash_attention_mma_Kstage_forward<64>(
+                Q, K, V, O,
+                dims.B, dims.H, dims.N,
+                scale,
+                stream);
+            break;
+        case 128:
+            launch_flash_attention_mma_Kstage_forward<128>(
+                Q, K, V, O,
+                dims.B, dims.H, dims.N,
+                scale,
+                stream);
+            break;
+        default:
+            return;
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template<int D>
+void launch_flash_attention_mma_cutlass_forward(
+    const float* Q,
+    const float* K,
+    const float* V,
+    float* O,
+    const int B, const int H, const int N,
+    const float scale,
+    cudaStream_t stream);
+
+void flash_attention_mma_cutlass_forward(
+    const float* Q,
+    const float* K,
+    const float* V,
+    float* O,
+    const AttentionDims& dims,
+    cudaStream_t stream) {
+    const float scale = compute_scale(dims.D);
+    
+    switch (dims.D)
+    {
+        case 64:
+            launch_flash_attention_mma_cutlass_forward<64>(
+                Q, K, V, O,
+                dims.B, dims.H, dims.N,
+                scale,
+                stream);
+            break;
+        case 128:
+            launch_flash_attention_mma_cutlass_forward<128>(
+                Q, K, V, O,
+                dims.B, dims.H, dims.N,
+                scale,
+                stream);
+            break;
+        default:
+            return;
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

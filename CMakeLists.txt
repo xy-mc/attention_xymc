@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.8 FATAL_ERROR)
 project(attention_xymc CUDA CXX)
 
+# 默认使用 Release 构建（当未显式指定时）
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    message(STATUS "No build type selected, defaulting to Release")
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "RelWithDebInfo" "MinSizeRel")
+endif()
+
 # 设置CUDA架构
 set(CMAKE_CUDA_ARCHITECTURES 86)  # 根据你的GPU调整
 
@@ -25,8 +32,16 @@ endif()
 
 # 设置调试标志
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G -g -O0 -lineinfo")
+    # -G 已经包含了 -lineinfo 的功能，同时使用会冲突
+    # -G: 生成设备代码调试信息（包含行号信息）
+    # -g: 生成主机代码调试信息
+    # -O0: 禁用优化
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -G -g -O0 -arch=sm_86")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O0")
+    # 确保在Debug模式下禁用优化和内联
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --ptxas-options=-O0")
+    # 保留源代码信息以便调试时行号对应（在PTX中嵌入源代码）
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --source-in-ptx")
 endif()
 
 # 添加头文件目录
@@ -43,6 +58,7 @@ set(SOURCES
     src/kernels/flash_attention_mma.cu
     src/kernels/flash_attention_mma_optimize.cu
     src/kernels/flash_attention_mma_Kstage.cu
+    src/kernels/flash_attention_mma_cutlass.cu
     src/kernels/flash_attention_target.cu
     src/kernels/standard_attention.cu
 )

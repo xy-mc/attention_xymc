@@ -206,6 +206,15 @@ __global__ void flash_attention_mma_Kstage_forward_kernel(
         }
 
         float* smem_k_current = smem_k + (j % Kstage) * Bc * (D + PAD);
+        
+        // if (i == 0 && j == 0 && b == 0 && h == 0 && tx == 0) {
+        //     printf("mma_Kstage: R_Q values:\n");
+        //     for (int mma = 0; mma < kWarpTileSeqLenQ; mma++) {
+        //         for (int q = 0; q < 4; q++) {
+        //             printf("  R_Q(%d, %d) = %f\n", mma, q, (float)R_Q[mma][q]);
+        //         }   
+        //     }
+        // }
 
         for (int d = 0; d < D; d += KMmaAtomK) {
             #pragma unroll
@@ -238,10 +247,14 @@ __global__ void flash_attention_mma_Kstage_forward_kernel(
             }
         }
         
-        // if (i == 0 && b == 0 && h == 0 && tx == 1)
-        //     printf("R_S[0][0][0]: %f, R_S[0][0][1]: %f\n", 
-        //         R_S[0][0][0], R_S[0][0][1]);
-
+        // if (i == 0 && j == 0 && b == 0 && h == 0 && tx == 0) {
+        //     for (int q = 0; q < kWarpTileSeqLenQ; q++) {
+        //         for (int k = 0; k < kWarpTileSeqLenK; k++) {
+        //             printf("mma_Kstage: R_S[%d][%d][0]: %f, R_S[%d][%d][1]: %f, R_S[%d][%d][2]: %f, R_S[%d][%d][3]: %f\n", 
+        //                 q, k, (float)R_S[q][k][0], q, k, (float)R_S[q][k][1], q, k, (float)R_S[q][k][2], q, k, (float)R_S[q][k][3]);
+        //         }
+        //     }
+        // }
         // __syncthreads();
         
         #pragma unroll
@@ -250,15 +263,25 @@ __global__ void flash_attention_mma_Kstage_forward_kernel(
             for (int k = 0; k < kWarpTileSeqLenK; k++) {
                 float tmp_max_0 = max(R_S[q][k][0], R_S[q][k][1]) * scale;
                 float tmp_max_1 = max(R_S[q][k][2], R_S[q][k][3]) * scale;
+                // if (i == 0 && j == 0 && b == 0 && h == 0 && tx == 0) {
+                //     printf("mma_Kstage: tmp_max_0: %f, tmp_max_1: %f\n", tmp_max_0, tmp_max_1);
+                // }
                 lane_row_max_new[q][0] = max(lane_row_max_new[q][0], tmp_max_0);
                 lane_row_max_new[q][1] = max(lane_row_max_new[q][1], tmp_max_1);
             }
         }
 
+        // if (i == 0 && j == 0 && b == 0 && h == 0 && tx == 0) {
+        //     printf("mma_Kstage: lane_row_max_new: %f, %f\n", lane_row_max_new[0][0], lane_row_max_new[0][1]);
+        // }
+
         #pragma unroll
         for (int q = 0; q < kWarpTileSeqLenQ; q++) {
             lane_row_max_new[q][0] = warp_reduce_max<float, 4>(lane_row_max_new[q][0]);
             lane_row_max_new[q][1] = warp_reduce_max<float, 4>(lane_row_max_new[q][1]);
+            // if (i == 0 && j == 0 && b == 0 && h == 0 && tx == 0) {
+            //     printf("mma_Kstage: lane_row_max_new: %f, %f\n", lane_row_max_new[q][0], lane_row_max_new[q][1]);
+            // }
         }
 
         float acc[kWarpTileSeqLenQ][2];
@@ -281,10 +304,18 @@ __global__ void flash_attention_mma_Kstage_forward_kernel(
         for (int q = 0; q < kWarpTileSeqLenQ; q++) {
             acc[q][0] = warp_reduce_sum<float, 4>(acc[q][0]);
             acc[q][1] = warp_reduce_sum<float, 4>(acc[q][1]);
+
+            // if (i == 0 && j == 0 && b == 0 && h == 0 && tx == 0) {
+            //     printf("mma_Kstage: acc: %f, %f\n", acc[q][0], acc[q][1]);
+            // }
             lane_row_sum_new[q][0] = __fmaf_rn(__expf(lane_row_max_old[q][0] - lane_row_max_new[q][0]),
                                     lane_row_sum_new[q][0], acc[q][0]);
             lane_row_sum_new[q][1] = __fmaf_rn(__expf(lane_row_max_old[q][1] - lane_row_max_new[q][1]),
                                     lane_row_sum_new[q][1], acc[q][1]);
+
+            // if (i == 0 && j == 1 && b == 0 && h == 0 && tx == 0) {
+            //     printf("mma_Kstage: lane_row_sum_new: %f, %f\n", lane_row_sum_new[q][0], lane_row_sum_new[q][1]);
+            // }
         }
             
         // __syncthreads();
@@ -325,6 +356,10 @@ __global__ void flash_attention_mma_Kstage_forward_kernel(
                                 swizzle_V(smem_regV_addr_y, smem_regV_addr_x)]);
                     R_V[v][1] = __float_as_uint(smem_v[(smem_regV_addr_y + 1) * (D + PAD) + 
                                 swizzle_V(smem_regV_addr_y + 1, smem_regV_addr_x)]);
+                    
+                    // if (i == 0 && j == 0 && b == 0 && h == 0 && tx == 0) {
+                    //     printf("mma_Kstage: R_V: %f, %f\n", __uint_as_float(R_V[v][0]), __uint_as_float(R_V[v][1]));
+                    // }
 
                     SMMA1688(R_D[p][v][0], R_D[p][v][1], R_D[p][v][2], R_D[p][v][3], RS0, RS1, RS2, RS3, 
                         R_V[v][0], R_V[v][1], R_D[p][v][0], R_D[p][v][1], R_D[p][v][2], R_D[p][v][3]);
@@ -346,6 +381,10 @@ __global__ void flash_attention_mma_Kstage_forward_kernel(
                 R_O[p][v][1] = __fmaf_rn(__expf(lane_row_max_old[p][0] - lane_row_max_new[p][0]), R_O[p][v][1], R_D[p][v][1]);
                 R_O[p][v][2] = __fmaf_rn(__expf(lane_row_max_old[p][1] - lane_row_max_new[p][1]), R_O[p][v][2], R_D[p][v][2]);
                 R_O[p][v][3] = __fmaf_rn(__expf(lane_row_max_old[p][1] - lane_row_max_new[p][1]), R_O[p][v][3], R_D[p][v][3]);
+
+                // if (i == 0 && j == 1 && b == 0 && h == 0 && tx == 0) {
+                //     printf("mma_Kstage: R_O: %f, %f, %f, %f\n", R_O[p][v][0], R_O[p][v][1], R_O[p][v][2], R_O[p][v][3]);
+                // }
             }
         }
 
@@ -375,6 +414,10 @@ __global__ void flash_attention_mma_Kstage_forward_kernel(
             R_O[p][v][2] = __fdividef(R_O[p][v][2], lane_row_sum_new[p][1]);
             R_O[p][v][3] = __fdividef(R_O[p][v][3], lane_row_sum_new[p][1]);
             
+            // if (i == 0 && b == 0 && h == 0 && tx == 32) {
+            //     printf("mma_Kstage: R_O: %f, %f, %f, %f\n", R_O[p][v][0], R_O[p][v][1], R_O[p][v][2], R_O[p][v][3]);
+            // }
+
             LDST64BITS(O_start[reg_global_y * D + reg_global_x + v * KMmaAtomN])
                 = LDST64BITS(R_O[p][v][0]);
 
@@ -384,12 +427,13 @@ __global__ void flash_attention_mma_Kstage_forward_kernel(
     }
 }
 
+template<int D>
 void launch_flash_attention_mma_Kstage_forward(
     const float* Q,
     const float* K,
     const float* V,
     float* O,
-    int B, int H, int N, int D,
+    int B, int H, int N,
     float scale,
     cudaStream_t stream) {
     
@@ -403,7 +447,7 @@ void launch_flash_attention_mma_Kstage_forward(
     constexpr int kWarpTileSeqLenQ = 2;
     constexpr int kWarpTileSeqLenK = 4;
     constexpr int kWarpTileSeqLenP = 2;
-    constexpr int kWarpTileHeadDimV = 4;
+    constexpr int kWarpTileHeadDimV = D / (KMmaAtomN * kMmaTileHeadDimV);
 
     constexpr int NumThreads = WARP_SIZE * kMmaTileSeqLenQ;
 
@@ -449,4 +493,10 @@ void launch_flash_attention_mma_Kstage_forward(
 
 } // namespace attention
 
+template void attention::launch_flash_attention_mma_Kstage_forward<64>(
+    const float*, const float*, const float*, float*,
+    int, int, int, float, cudaStream_t);
 
+template void attention::launch_flash_attention_mma_Kstage_forward<128>(
+    const float*, const float*, const float*, float*,
+    int, int, int, float, cudaStream_t);

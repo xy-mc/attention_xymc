@@ -1,0 +1,26 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "CUDA Nsight Debug",
+            "type": "cuda-gdb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bench_attention",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/local/cuda/bin/cuda-gdb",
+            "setupCommands": [
+                { "description": "Enable pretty-printing for gdb", "text": "-enable-pretty-printing", "ignoreFailures": true },
+                { "description": "Set CUDA break on kernel launch", "text": "set cuda break_on_launch application", "ignoreFailures": true },
+                { "description": "Break at kernel launch function", "text": "break launch_flash_attention_mma_cutlass_forward", "ignoreFailures": true },
+                { "description": "Break at cutlass kernel using pattern", "text": "rbreak flash_attention_mma_cutlass_forward_kernel", "ignoreFailures": true }
+            ],
+            "preLaunchTask": "build",
+            "visualizerFile": "${workspaceFolder}/.vscode/nsight_visualizer.json"
+        }
+    ]
+}

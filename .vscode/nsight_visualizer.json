@@ -1,0 +1,11 @@
+{
+    "version": "1.0",
+    "trace": {
+        "recordMemory": true,
+        "recordSass": false
+    },
+    "launch": {
+        "stopOnEntry": false
+    }
+}
+

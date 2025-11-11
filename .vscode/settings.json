@@ -60,5 +60,8 @@
         "cinttypes": "cpp",
         "typeinfo": "cpp",
         "iomanip": "cpp"
-    }
+    },
+    "cmake.buildType": "Debug",
+    "cmake.buildConfig": "Debug",
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools"
 }

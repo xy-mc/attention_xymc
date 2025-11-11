@@ -10,6 +10,7 @@
 #include <functional>
 #include <cmath> // Added for std::abs
 #include <string>
+#include <algorithm> // For std::min
 
 /*
 smem 是max(smem_qk,smem_v)
@@ -134,6 +135,52 @@ public:
     
     void copyRefToHost() {
         cudaMemcpy(h_O_ref, d_O, size_O * sizeof(float), cudaMemcpyDeviceToHost);
+    }
+    
+    // 打印 QKV 矩阵（BHND 格式）- 打印 B=0, H=0 的所有 N 和 D
+    void printQKV() {
+        int B = dims.B;
+        int H = dims.H;
+        int N = dims.N;
+        int D = dims.D;
+        
+        printf("\n========== Source QKV Matrices (B=%d, H=%d, N=%d, D=%d) ==========\n", B, H, N, D);
+        printf("Printing full matrices for B=0, H=0 (all %d rows, all %d dims)\n", N, D);
+        
+        // 只打印第一个 batch 和第一个 head
+        int b = 0, h = 0;
+        
+        // 打印 Q 矩阵（完整）- 矩阵格式：N行 x D列
+        printf("\n--- Q Matrix (b=%d, h=%d, shape: %d x %d) ---\n", b, h, N, D);
+        for (int n = 0; n < N; n++) {
+            for (int d = 0; d < D; d++) {
+                int idx = ((b * H + h) * N + n) * D + d;
+                printf("%8.4f ", h_Q[idx]);
+            }
+            printf("\n");
+        }
+        
+        // 打印 K 矩阵（完整）- 矩阵格式：N行 x D列
+        printf("\n--- K Matrix (b=%d, h=%d, shape: %d x %d) ---\n", b, h, N, D);
+        for (int n = 0; n < N; n++) {
+            for (int d = 0; d < D; d++) {
+                int idx = ((b * H + h) * N + n) * D + d;
+                printf("%8.4f ", h_K[idx]);
+            }
+            printf("\n");
+        }
+        
+        // 打印 V 矩阵（完整）- 矩阵格式：N行 x D列
+        printf("\n--- V Matrix (b=%d, h=%d, shape: %d x %d) ---\n", b, h, N, D);
+        for (int n = 0; n < N; n++) {
+            for (int d = 0; d < D; d++) {
+                int idx = ((b * H + h) * N + n) * D + d;
+                printf("%8.4f ", h_V[idx]);
+            }
+            printf("\n");
+        }
+        
+        printf("========================================================\n\n");
     }
 };
 
@@ -411,6 +458,32 @@ void write_matrix_to_file(const std::string& filename, const float* matrix, int 
     outfile.close();
 }
 
+// 将 (b=指定, h=指定) 的完整 N×D 子矩阵写入文件（只输出该切片）
+void write_matrix_bh_slice_to_file(const std::string& filename,
+                                   const float* matrix,
+                                   int B, int H, int N, int D,
+                                   int b_sel, int h_sel) {
+    std::ofstream outfile(filename);
+    if (!outfile.is_open()) {
+        std::cerr << "Error: Could not open file " << filename << std::endl;
+        return;
+    }
+    if (b_sel < 0 || b_sel >= B || h_sel < 0 || h_sel >= H) {
+        std::cerr << "Error: Invalid (b,h) slice: (" << b_sel << "," << h_sel << ")\n";
+        return;
+    }
+    outfile << std::fixed << std::setprecision(30);
+    outfile << "Batch " << b_sel << ", Head " << h_sel << ":\n";
+    for (int n = 0; n < N; ++n) {
+        for (int d = 0; d < D; ++d) {
+            const int idx = ((b_sel * H + h_sel) * N + n) * D + d; // BHND
+            outfile << matrix[idx] << (d + 1 == D ? '\n' : ' ');
+        }
+    }
+    outfile << "\n";
+    outfile.close();
+}
+
 // 将矩阵的一个 (b,h) 在 N 维从 n0 开始、大小为 Br 的切片，以 Br×D 形式写入
 void write_matrix_tile_BrD(const std::string& filename,
                            const float* matrix,
@@ -441,8 +514,8 @@ void run_and_write(const RunFunc& func, AttentionData& data, const std::string& 
     func(data.d_Q, data.d_K, data.d_V, data.d_O, data.dims, 0);
     cudaDeviceSynchronize();
     data.copyToHost();
-    // write_matrix_to_file(filename, data.h_O, data.dims.B, data.dims.H, data.dims.N, data.dims.D);
-    write_matrix_tile_BrD(filename, data.h_O, data.dims.B, data.dims.H, data.dims.N, data.dims.D, 0, 0, 0, 64);
+    // 仅输出 B=0, H=0 的完整 N×D
+    write_matrix_bh_slice_to_file(filename, data.h_O, data.dims.B, data.dims.H, data.dims.N, data.dims.D, 0, 0);
     std::cout << "Results written to: " << filename << std::endl;
 }
 
@@ -502,8 +575,8 @@ int main() {
     // const std::vector<int> Ns = {128, 256, 512, 1024, 2048, 4096};
     // const std::vector<int> Ds = {64, 128};
 
-    // // // 基准（其他维度的默认值）
-    // const int B0 = 1, H0 = 8, N0 = 1024, D0 = 64;
+    // // 基准（其他维度的默认值）
+    // const int B0 = 32, H0 = 8, N0 = 1024, D0 = 64;
 
     // // 扫描 B
     // for (int b : Bs) test_cases.push_back({b, H0, N0, D0});
@@ -513,9 +586,9 @@ int main() {
     // for (int n : Ns) test_cases.push_back({B0, H0, n, D0});
     // // 扫描 D
     // for (int d : Ds) test_cases.push_back({B0, H0, N0, d});
-    // 额外加入几个代表性组合
-    test_cases.push_back({64, 8, 1024, 64});
-    // test_cases.push_back({16, 8, 1024, 64});
+    // // 额外加入几个代表性组合
+    // test_cases.push_back({64, 8, 1024, 64});
+    test_cases.push_back({16, 8, 1024, 64});
 
     // 测试每个维度
     for (const auto& dims : test_cases) {
@@ -555,6 +628,10 @@ int main() {
         // 生成可复现的 N(0,1) 测试数据
         data.initialize_normal(0.0f, 1.0f, /*seed=*/1234);
         // data.initialize();
+        
+        // 打印生成的 QKV 矩阵（B=0, H=0 的完整矩阵）
+        // data.printQKV();
+        
         data.copyToDevice();
 
         // 运行参考实现
@@ -563,6 +640,7 @@ int main() {
         // 运行所有版本的注意力
         std::vector<PerformanceResult> results;
         
+        // attention::flash_attention_mma_cutlass_forward(data.d_Q, data.d_K, data.d_V, data.d_O, data.dims, 0);
         // results.push_back(runPerformanceTest(
         //     attention::attention_naive_forward, data, num_test, "Naive Attention"));
         // results.push_back(runPerformanceTest(
@@ -577,10 +655,12 @@ int main() {
         //     attention::flash_attention_v2_optimize_forward, data, num_test, "Flash Attention_v2_optimize"));
         // results.push_back(runPerformanceTest(
         //     attention::flash_attention_mma_forward, data, num_test, "Flash Attention_mma"));
-        results.push_back(runPerformanceTest(
-            attention::flash_attention_mma_optimize_forward, data, num_test, "Flash Attention_mma_optimize"));
+        // results.push_back(runPerformanceTest(
+        //     attention::flash_attention_mma_optimize_forward, data, num_test, "Flash Attention_mma_optimize"));
         results.push_back(runPerformanceTest(
             attention::flash_attention_mma_Kstage_forward, data, num_test, "Flash Attention_mma_Kstage"));
+        results.push_back(runPerformanceTest(
+            attention::flash_attention_mma_cutlass_forward, data, num_test, "Flash Attention_mma_cutlass"));
         // results.push_back(runPerformanceTest(
         //     attention::flash_attention_target_forward, data, num_test, "Flash Attention_target_half"));
         // results.push_back(runKernelOnlyTargetHalf(
@@ -631,12 +711,13 @@ int main() {
         //     attention::flash_attention_mma_optimize_forward, data, "Flash Attention_mma_optimize"));
         // error_results.push_back(runErrorTest(
         //     attention::flash_attention_mma_Kstage_forward, data, "Flash Attention_mma_Kstage"));
-
+        // error_results.push_back(runErrorTest(
+        //     attention::flash_attention_mma_cutlass_forward, data, "Flash Attention_mma_cutlass"));
         for (const auto& result : error_results) {
             printErrorResult(result);
         }
 
-        // 输出结果到文件（选择要输出的实现）
+        // // 输出结果到文件（选择要输出的实现）
         // std::string base_filename = std::string("attention_result_") +
         //     std::to_string(dims.B) + "x" +
         //     std::to_string(dims.H) + "x" +
@@ -645,8 +726,8 @@ int main() {
 
         // // 参考结果
         // std::string ref_filename = base_filename + "_reference.txt";
-        // // write_matrix_to_file(ref_filename, data.h_O_ref, dims.B, dims.H, dims.N, dims.D);
-        // write_matrix_tile_BrD(ref_filename, data.h_O_ref, dims.B, dims.H, dims.N, dims.D, 0, 0, 0, 64);
+        // // 仅输出 B=0, H=0 的完整 N×D 参考结果
+        // write_matrix_bh_slice_to_file(ref_filename, data.h_O_ref, dims.B, dims.H, dims.N, dims.D, 0, 0);
         // std::cout << "\nReference results written to: " << ref_filename << std::endl;
 
         // // 根据需要在此列表中添加/移除要输出的实现
@@ -658,6 +739,7 @@ int main() {
         //         // {attention::flash_attention_mma_forward, "mma"},
         //         {attention::flash_attention_mma_optimize_forward, "mma_optimize"},
         //         {attention::flash_attention_mma_Kstage_forward, "mma_Kstage"},
+        //         {attention::flash_attention_mma_cutlass_forward, "mma_cutlass"},
         //     },
         //     base_filename);
     }
